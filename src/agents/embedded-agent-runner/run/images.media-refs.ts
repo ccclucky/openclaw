@@ -13,6 +13,8 @@ export type MediaFileRef = {
   raw: string;
   type: "path" | "media-uri";
   resolved: string;
+  /** Resolved path is the execution-only copy staged into the sandbox workspace. */
+  staged?: boolean;
 };
 
 export type MediaImageRef = MediaFileRef & {
@@ -59,6 +61,9 @@ export function resolveMediaFactLocalRef(fact: MediaFact): MediaFileRef | undefi
     raw: identity,
     type: mediaUri ? "media-uri" : "path",
     resolved: resolved.startsWith("~") ? resolveUserPath(resolved) : resolved,
+    // Only the staged copy has no managed identity left, so it must be read by the
+    // sandbox/workspace reader that owns the workspace it was staged into.
+    ...(fact.staged === true && !mediaUri ? { staged: true } : {}),
   };
 }
 

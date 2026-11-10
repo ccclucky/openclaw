@@ -1,0 +1,4 @@
+# #196744 (native image staged sandbox): exact 102-line regression growth for reading staged
+# sandbox copies through the workspace reader when a turn-attachment preparer is bound
+# (image absolute/relative and video), plus the 20-line inherited base drift on b21829a4c85.
+122

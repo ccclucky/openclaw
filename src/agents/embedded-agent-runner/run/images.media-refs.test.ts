@@ -8,6 +8,7 @@ import { normalizeMediaFacts, resolveMediaFacts } from "../../../media/media-fac
 import * as utils from "../../../utils.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import { createHostSandboxFsBridge } from "../../test-helpers/host-sandbox-fs-bridge.js";
+import { registerAgentWorkspaceAccess } from "../../workspace-access.js";
 import {
   detectAndLoadPromptImages,
   hasHydratableMediaImages,
@@ -249,6 +250,57 @@ describe("fact-carried image references", () => {
     });
     expect(result.images[0]).toMatchObject(image());
   });
+
+  it.each(["absolute", "relative"] as const)(
+    "reads a staged sandbox copy (%s path) when a turn-attachment preparer is bound",
+    async (pathForm) => {
+      const sandboxRoot = tempDirs.make("openclaw-staged-bound-sandbox-");
+      const storeRoot = tempDirs.make("openclaw-staged-bound-store-");
+      const mediaId = "photo---33333333-3333-3333-3333-333333333333.png";
+      const mediaUri = `media://inbound/${mediaId}`;
+      const originalPath = await writeImage(storeRoot, `media/inbound/${mediaId}`);
+      const stagedPath = await writeImage(sandboxRoot, `media/inbound/staged/${mediaId}`);
+      const release = registerAgentWorkspaceAccess(sandboxRoot, {
+        bridge: createHostSandboxFsBridge(sandboxRoot),
+        prepareTurnAttachments: async () => undefined,
+      });
+
+      try {
+        const result = await loadImages({
+          prompt: "",
+          media: [
+            {
+              path: pathForm === "absolute" ? stagedPath : path.relative(sandboxRoot, stagedPath),
+              url: mediaUri,
+              contentType: "image/png",
+              staged: true,
+              workspaceDir: sandboxRoot,
+            },
+          ],
+          userTurnTranscriptRecorder: {
+            resolveMessage: async () =>
+              ({
+                role: "user",
+                content: "inspect",
+                __openclaw: {
+                  media: [
+                    { path: originalPath, url: mediaUri, contentType: "image/png", kind: "image" },
+                  ],
+                },
+              }) as never,
+          },
+          imageOrder: ["offloaded"],
+          workspaceDir: sandboxRoot,
+          workspaceOnly: true,
+          sandbox: sandboxAt(sandboxRoot),
+        });
+
+        expect(result).toMatchObject({ loadedCount: 1, failedMediaCount: 0, images: [image()] });
+      } finally {
+        release();
+      }
+    },
+  );
 
   it.each([false, true])(
     "rejects encoded traversal claim-check facts (sandbox=%s)",

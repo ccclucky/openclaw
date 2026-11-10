@@ -177,8 +177,11 @@ async function loadMediaFromRef(
 ): Promise<WebMediaResult | null> {
   options.signal?.throwIfAborted();
   // Admitted managed originals belong to Gateway; staged and discovered paths stay sandboxed.
+  // A staged copy only exists inside the sandbox workspace, so it must be read by the
+  // sandbox reader even when a turn-attachment preparer is bound for managed originals.
   const gatewayAttachment =
     attachment &&
+    ref.staged !== true &&
     Boolean(
       ref.type === "media-uri" ||
       getAgentWorkspaceAccess(

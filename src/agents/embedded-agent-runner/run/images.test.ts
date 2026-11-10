@@ -7,6 +7,7 @@ import { createNoisyPngBuffer } from "../../../../test/helpers/image-fixtures.js
 import { useAutoCleanupTempDirTracker } from "../../../../test/helpers/temp-dir.js";
 import { buildInboundMediaNoteProjection } from "../../../auto-reply/media-note.js";
 import { resolvePreferredOpenClawTmpDir } from "../../../infra/tmp-openclaw-dir.js";
+import type { Context } from "../../../llm/types.js";
 import * as mediaLocalRoots from "../../../media/local-roots.js";
 import {
   attachRuntimePromptMediaFacts,
@@ -19,12 +20,14 @@ import {
 import { captureEnv, setTestEnvValue } from "../../../test-utils/env.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import { createUnsafeMountedSandbox } from "../../test-helpers/unsafe-mounted-sandbox.js";
+import { registerAgentWorkspaceAccess } from "../../workspace-access.js";
 import { log } from "../logger.js";
 import { describedImageUnderstanding } from "./image-description.test-support.js";
 import {
   detectAndLoadPromptImages,
   detectImageReferences,
   hydratePromptMediaMessages,
+  materializeProviderContext,
 } from "./images.js";
 import { prepareEmbeddedAttemptPromptExecution } from "./prompt-image-preparation.js";
 
@@ -594,5 +597,52 @@ describe("hydratePromptMediaMessages", () => {
       inlineImage,
       inlineImage,
     ]);
+  });
+});
+
+describe("materializeProviderContext", () => {
+  it("reads a staged sandbox video when a turn-attachment preparer is bound", async () => {
+    const sandboxRoot = tempDirs.make("openclaw-staged-video-sandbox-");
+    const sandbox = createUnsafeMountedSandbox({ sandboxRoot, agentRoot: sandboxRoot });
+    const bridge = sandbox.fsBridge;
+    if (!bridge) {
+      throw new Error("sandbox fs bridge missing");
+    }
+    const video = Buffer.concat([
+      Buffer.from("0000001c6674797069736f6d0000000069736f6d0000000000000000", "hex"),
+      Buffer.from([0x33]),
+    ]);
+    const stagedPath = path.join(sandboxRoot, "media/inbound/staged/clip.mp4");
+    await fs.mkdir(path.dirname(stagedPath), { recursive: true });
+    await fs.writeFile(stagedPath, video);
+    const release = registerAgentWorkspaceAccess(sandboxRoot, {
+      bridge,
+      prepareTurnAttachments: async () => undefined,
+    });
+
+    try {
+      const message = attachRuntimePromptMediaFacts({ role: "user" as const, content: "watch" }, [
+        {
+          path: stagedPath,
+          contentType: "video/mp4",
+          kind: "video",
+          staged: true,
+          workspaceDir: sandboxRoot,
+        },
+      ]) as unknown as AgentMessage;
+      const result = await materializeProviderContext({
+        context: { messages: [message] } as unknown as Context,
+        workspaceDir: sandboxRoot,
+        workspaceOnly: true,
+        sandbox: { root: sandboxRoot, bridge },
+      });
+
+      expect(result.messages[0]?.content).toEqual([
+        { type: "text", text: "watch" },
+        { type: "video", data: video.toString("base64"), mimeType: "video/mp4" },
+      ]);
+    } finally {
+      release();
+    }
   });
 });
