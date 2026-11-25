@@ -16,6 +16,7 @@ import {
   readAdmittedRunOperatorAuthority,
   resolveAdmittedRunActiveAssertion,
 } from "../../admitted-run-context.js";
+import { isHostSystemTurn } from "../../agent-tools.turn-authority.js";
 import {
   buildBootstrapPromptWarningNotice,
   buildBootstrapTruncationReportMeta,
@@ -36,7 +37,8 @@ import type { buildConfiguredAgentSystemPrompt } from "../../system-prompt-confi
 import { buildSystemPromptReport } from "../../system-prompt-report.js";
 import { toolPolicyRestrictsTools } from "../../tool-policy.js";
 import type { ToolSearchCatalogRef } from "../../tool-search.js";
-import { buildToolSchemaDirectoryPrompt } from "../../tool-search.js";
+import { buildRunGrantedToolDirectory, buildToolSchemaDirectoryPrompt } from "../../tool-search.js";
+import type { ToolUsageRankingSnapshot } from "../../tool-usage-ranking.js";
 import {
   buildWatchedSessionsPromptLines,
   prepareWatchedSessionsPromptAsync,
@@ -84,7 +86,11 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
   };
   referencePaths?: Awaited<ReturnType<typeof resolveOpenClawReferencePaths>>;
   remoteWorkspace?: boolean;
+  /** Session tools are the worker-placed variants. */
+  workerPlacement?: boolean;
   toolSchemaDirectoryPrompt?: () => string | undefined;
+  /** Pre-rendered run-granted listing for callers whose catalog is gone after projection. */
+  runGrantedToolDirectory?: () => string | undefined;
   bootstrap: PreparedBootstrap;
   capabilityToolNames: Set<string>;
   effectiveTools: PromptTools;
@@ -92,6 +98,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
   modelToolsEnabled: boolean;
   skillsPrompt: string;
   codeModeActive?: boolean;
+  getUsageRanking?: () => ToolUsageRankingSnapshot | undefined;
   webSearchUnconfigured?: () => boolean;
   toolSearchCatalogRef?: ToolSearchCatalogRef;
   toolSearchDirectoryEnabled: boolean;
@@ -176,6 +183,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
             sessionKey: params.setup.sandboxSessionKey,
           },
           params.toolSearchCatalogRef?.current?.entries ?? [],
+          params.getUsageRanking?.(),
         )
       : params.toolSearchDirectoryEnabled && params.toolSearchCatalogRef?.current?.entries.length
         ? buildToolSchemaDirectoryPrompt(
@@ -188,11 +196,16 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
               runId: attempt.runId,
               catalogRef: params.toolSearchCatalogRef,
             },
-            { contextTokenBudget: attempt.contextTokenBudget },
+            {
+              contextTokenBudget: attempt.contextTokenBudget,
+              usageRanking: params.getUsageRanking?.(),
+            },
           )
         : undefined);
 
   const toolSchemaDirectoryPrompt = resolveToolSchemaDirectoryPrompt();
+  // The cached directory omits run-granted tools; the turn holding the grant lists them.
+  let runGrantedToolsListed = !params.codeModeActive && toolSchemaDirectoryPrompt !== undefined;
 
   // Only externally publishable origins need the admitted session's sharing facts.
   phases.mark("attempt.system-prompt.session-entry");
@@ -251,7 +264,11 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
     attempt.promptMode ??
     (params.isRawModelRun ? "none" : resolvePromptModeForSession(attempt.sessionKey));
   const promptSurface = resolveAgentPromptSurfaceForSessionKey(attempt.sessionKey);
-  const toolPolicyRestricted = toolPolicyRestrictsTools({ allow: attempt.toolsAllow });
+  // A host system turn (an exec or child completion wake) inherits its producer's tool
+  // ceiling. That ceiling gates calls; it does not make the session a narrowly scoped run.
+  // Keep the session's prompt mode so the cached prefix survives the wake.
+  const toolPolicyRestricted =
+    !isHostSystemTurn(attempt) && toolPolicyRestrictsTools({ allow: attempt.toolsAllow });
   const effectivePromptMode = toolPolicyRestricted ? ("minimal" as const) : promptMode;
   phases.mark("attempt.system-prompt.provider");
   const providerPromptContext = {
@@ -414,6 +431,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
       config: attempt.config,
       preparedModelRuntime: attempt.preparedModelRuntime,
       preparedTtsPreferences,
+      prepareSessionProjectGuidance: attempt.prepareSessionProjectGuidance,
       agentId: params.setup.sessionAgentId,
       workspaceDir: params.setup.effectiveWorkspace,
       runtimeCwd: params.setup.effectiveCwd,
@@ -445,6 +463,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
         surface: promptSurface,
       }),
       toolSchemaDirectoryPrompt,
+      workerPlacement: params.workerPlacement,
       deferredToolsDirectlyCallable: params.deferredToolsDirectlyCallable,
       sandboxInfo,
       // oxlint-disable-next-line unicorn/no-array-sort -- The materialized set array is private.
@@ -452,6 +471,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
       tools: params.effectiveTools,
       contextFiles: params.bootstrap.contextFiles,
       bootstrapMode: params.bootstrap.bootstrapMode,
+      bootstrapCompleted: params.bootstrap.bootstrapCompleted,
       bootstrapTruncationNotice: buildBootstrapPromptWarningNotice(
         params.bootstrap.bootstrapPromptWarning.lines,
       ),
@@ -497,6 +517,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
     capabilities: [...params.capabilityToolNames].sort(),
     catalogEntries: params.toolSearchCatalogRef?.current?.entries,
     permissionChanged,
+    usageRanking: params.getUsageRanking?.(),
   });
   let toolPromptPreparation = {
     ...readToolPromptInputs([...params.effectiveTools]),
@@ -519,6 +540,13 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
         }),
         ...turnInstructions,
       ];
+      const runGrantedTools = runGrantedToolsListed
+        ? (params.runGrantedToolDirectory?.() ??
+          buildRunGrantedToolDirectory(params.toolSearchCatalogRef))
+        : undefined;
+      if (runGrantedTools) {
+        fragments.push({ kind: "runtime-instruction", text: runGrantedTools });
+      }
       if (currentWatchedSessions) {
         fragments.push({
           kind: "conversation-data",
@@ -536,6 +564,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
       const inputs = readToolPromptInputs(effectiveTools, permissionChanged);
       const { mode, capabilities, catalogEntries } = inputs;
       if (
+        toolPromptPreparation.usageRanking === inputs.usageRanking &&
         toolPromptPreparation.mode === mode &&
         toolPromptPreparation.permissionChanged === permissionChanged &&
         toolPromptPreparation.catalogEntries === catalogEntries &&
@@ -581,6 +610,8 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
           }
           assertPreparationCurrent();
           currentWatchedSessions = refreshedWatchedSessions;
+          runGrantedToolsListed =
+            !params.codeModeActive && refreshedToolSchemaDirectoryPrompt !== undefined;
           const systemPrompt = nextSystemPrompt.refreshSystemPrompt(
             currentSystemPrompt,
             permissionNotice,

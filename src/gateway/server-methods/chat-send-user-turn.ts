@@ -1,5 +1,8 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { GATEWAY_CLIENT_IDS } from "../../../packages/gateway-protocol/src/client-info.js";
+import {
+  GATEWAY_CLIENT_IDS,
+  isNativeAppUiClient,
+} from "../../../packages/gateway-protocol/src/client-info.js";
 import { resolveAgentDir, resolveAgentWorkspaceDir } from "../../agents/agent-scope.js";
 import { bindRequesterProfile } from "../../auto-reply/requester-profile.js";
 import type { RuntimeMsgContext as MsgContext } from "../../auto-reply/templating.js";
@@ -11,8 +14,10 @@ import {
 import { readPersistedMediaFacts, type MediaFact } from "../../media/media-facts.js";
 import { isProgressCardRefreshInputProvenance } from "../../sessions/input-provenance.js";
 import { prepareSessionParticipantInput } from "../../sessions/session-participant-input.js";
-import type { UserTurnInput } from "../../sessions/user-turn-transcript.js";
-import type { PersistedUserTurnMessage } from "../../sessions/user-turn-transcript.types.js";
+import type {
+  UserTurnInput,
+  PersistedUserTurnMessage,
+} from "../../sessions/user-turn-input.types.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import type { PreparedSkillLibrarySession } from "../../skills/library/selection.js";
 import {
@@ -32,7 +37,6 @@ import { resolveOperatorSessionCreation } from "../session-creation-provenance.j
 import { resolveGatewayInputParticipant } from "../session-input-participant.js";
 import { prepareSkillLibrarySessionCreation } from "../skill-library-session.js";
 import { captureGatewayUiCommandTarget } from "../ui-command-target.js";
-import { isAcpBridgeClient } from "./chat-origin-routing.js";
 import type { AdmittedChatSend } from "./chat-send-admission.js";
 import type { PreparedChatSendAttachments } from "./chat-send-attachments.js";
 import type { NormalizedChatSendRequest } from "./chat-send-request.js";
@@ -163,8 +167,7 @@ export function prepareChatSendUserTurn(params: {
   >;
   session: Pick<PreparedChatSendSession, "agentId" | "clientRunId" | "sessionKey"> &
     Partial<Pick<PreparedChatSendSession, "cfg">>;
-  admission: Pick<AdmittedChatSend, "originatingRoute"> &
-    Partial<Pick<AdmittedChatSend, "assertWorkAdmissionCurrent" | "assertClientUploadAllowed">>;
+  admission: Pick<AdmittedChatSend, "originatingRoute"> & Partial<AdmittedChatSend>;
   attachments: PreparedChatSendAttachments;
   client: GatewayRequestHandlerOptions["client"];
   logGateway: GatewayRequestContext["logGateway"];
@@ -179,10 +182,7 @@ export function prepareChatSendUserTurn(params: {
   const persistedMediaForTranscriptPromise = (async (): ReturnType<
     typeof persistInboundImagesForTranscript
   > => {
-    if (
-      (attachments.parsedImages.length === 0 && attachments.offloadedRefs.length === 0) ||
-      isAcpBridgeClient(client)
-    ) {
+    if (attachments.parsedImages.length === 0 && attachments.offloadedRefs.length === 0) {
       return { entries: [], omission: "none" };
     }
     return await persistInboundImagesForTranscript({
@@ -289,6 +289,7 @@ export function prepareChatSendUserTurn(params: {
     SessionCreation: { ...creation, ...(sandbox ? { sandbox } : {}) },
     ...resolveChatSendCallerContext(client, request.clientInfo, originatingChannel),
     GatewayRunToolBindings: request.toolBindings,
+    TurnGrant: admission.operatorAuthority?.grant,
     GatewayUiCommandTarget: gatewayUiCommandTarget,
   };
   const recoveredRequester = readQueuedChatInputAdmission(session.clientRunId)?.requesterProfile;
@@ -311,7 +312,7 @@ export function prepareChatSendUserTurn(params: {
     client &&
     requester &&
     (client.authenticatedUserId || client.internal?.authenticatedOperator) &&
-    isBrowserOperatorUiClient(request.clientInfo) &&
+    (isBrowserOperatorUiClient(request.clientInfo) || isNativeAppUiClient(request.clientInfo)) &&
     !isSyntheticGatewayCaller(client) &&
     externalInput
   ) {

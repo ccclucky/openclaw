@@ -303,8 +303,9 @@ export async function readAdmittedConfigSnapshot(params: {
                   measureDoctorConfigPreflightStep(
                     "admission.plugin-config",
                     async () => {
-                      const read = await params.readSnapshot(
-                        coreRecovery ? { isolateEnv: true } : undefined,
+                      const read = await withLiveStateReads(
+                        () => params.readSnapshot(coreRecovery ? { isolateEnv: true } : undefined),
+                        { startupConfig: true },
                       );
                       metadataMetrics = read.pluginMetadataSnapshot?.metrics ?? {};
                       return read;
@@ -391,7 +392,7 @@ async function assertStartupStateReady(params: {
     () => import("../state/openclaw-database-preflight.js"),
   );
   const agentCount = listAgentIds(params.cfg).length;
-  const admissionMetrics: Record<string, number> = { agentCount };
+  const admissionMetrics: Record<string, number | string> = { agentCount };
   let registeredDatabases: readonly { agentId: string; path: string }[] = [];
   await measureDoctorConfigPreflightStep(
     "admission.database-readiness",
