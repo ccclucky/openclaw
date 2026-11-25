@@ -15,6 +15,7 @@ import { join, resolve as resolvePath } from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
+import { validateWorkloadDefinition } from "../../scripts/lib/node-cache-workload-inputs.mts";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import {
   evaluateWorkflow,
@@ -310,6 +311,7 @@ describe("OpenClaw performance workflow", () => {
         "kova",
         "vitest-pair",
         "node-cache-diagnostics",
+        "node-cache-workload-qualification",
         "gateway-concurrency",
         "gateway-memory-caps",
         "gateway-cold-turn-calibration",
@@ -410,6 +412,160 @@ describe("OpenClaw performance workflow", () => {
     expect(upload.with?.["retention-days"]).toBe(30);
   });
 
+  it("isolates fixed workload controls from live, publishing, and release jobs", () => {
+    const workflow = readWorkflow();
+    const context = {
+      eventName: "workflow_dispatch",
+      inputs: {
+        mode: "node-cache-workload-qualification",
+        dispatch_id: "full-release-validation-workload-controls",
+        publish_reports: true,
+        live_openai_candidate: true,
+        deep_profile: true,
+      },
+    } as const;
+    for (const [name, job] of Object.entries(workflow.jobs ?? {})) {
+      expect(evaluateWorkflow(job.if, context), name).toBe(name === "node_cache_workload");
+    }
+    const job = workflow.jobs?.node_cache_workload;
+    expect(JSON.stringify(job?.env)).not.toMatch(/\brunner(?:\.|\[)/u);
+    expect(evaluateWorkflow(job?.if, { eventName: "schedule" })).toBe(false);
+    expect(job?.needs).toBeUndefined();
+    expect(job?.permissions).toEqual({ contents: "read" });
+    expect(job?.["runs-on"]).toBe("ubuntu-24.04");
+    expect(job?.["timeout-minutes"]).toBe(75);
+    expect(JSON.stringify(job)).not.toMatch(/secrets\.|cache\/restore/u);
+    for (const [name, ref] of [
+      ["Checkout workload control harness", "${{ github.sha }}"],
+      ["Checkout fixed Node cache workload", "8cfbac51a27a1195176a3564f6d7cfd7d6994c85"],
+    ] as const) {
+      expect(findStep(name, "node_cache_workload").with).toMatchObject({
+        ref,
+        "fetch-depth": 1,
+        "persist-credentials": false,
+      });
+    }
+    expect(findStep("Set up workload control Node", "node_cache_workload").with).toEqual({
+      "node-version": "24.22.1",
+      "check-latest": false,
+      "package-manager-cache": false,
+    });
+    expect(findStep("Set up fixed workload pnpm", "node_cache_workload").with?.["cache-mode"]).toBe(
+      "off",
+    );
+    const run = findStep("Qualify prepared workload Node cache controls", "node_cache_workload");
+    expect(run.run).toContain("--mode node-cache-workload-qualification");
+    expect(run.run).toContain('--harness-sha "$NODE_CACHE_HARNESS_SHA"');
+    expect(run.run).toContain('--timeout-ms 1800000 --run-attempt "$GITHUB_RUN_ATTEMPT"');
+    const upload = findStep("Upload workload control artifact", "node_cache_workload");
+    expect(upload.if).toBe("${{ always() }}");
+    expect(upload.with?.path).toBe("${{ runner.temp }}/node-cache-workload-results");
+  });
+
+  it("keeps the fixed workload definition public and independently pinned", () => {
+    const raw = JSON.parse(readFileSync("scripts/node-cache-workload-definition.json", "utf8"));
+    expect(raw).toEqual(validateWorkloadDefinition(raw));
+    expect(raw.workloadSha).toBe("8cfbac51a27a1195176a3564f6d7cfd7d6994c85");
+    expect(raw.workloadTree).toBe("d2ac3496b32ec041292ec25b188b670e6f0cf460");
+    expect(raw.expected).toHaveLength(20);
+    expect(raw.sourceIdentities).toHaveLength(5);
+    expect(raw).not.toHaveProperty("oracleProvenance");
+  });
+
+  posixIt.each(["2", "1"])(
+    "rejects an invalid workload request before setup (attempt %s)",
+    (attempt) => {
+      const validation = findStep("Validate workload control request", "node_cache_workload");
+      const root = tempDirs.make("node-cache-request-");
+      const githubEnv = join(root, "github-env");
+      const result = runWorkflowCommand("bash", ["-c", validation.run ?? ""], {
+        env: {
+          ...process.env,
+          GITHUB_RUN_ATTEMPT: attempt,
+          NODE_CACHE_HARNESS_SHA: "a".repeat(40),
+          TARGET_REF: "b".repeat(40),
+          GITHUB_ENV: githubEnv,
+          RUNNER_TEMP: root,
+        },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain(attempt === "2" ? "fresh run" : "target_ref");
+      expect(existsSync(githubEnv)).toBe(false);
+    },
+  );
+
+  posixIt(
+    "retains the observed runtime fingerprint before rejecting a fixed-runtime mismatch",
+    () => {
+      const root = tempDirs.make("node-cache-runtime-");
+      mkdirSync(join(root, "scripts"));
+      writeFileSync(
+        join(root, "scripts/node-cache-workload-definition.json"),
+        JSON.stringify({ runtime: { node: "v0.0.0" } }),
+      );
+      const prep = join(root, "preparation");
+      const record = findStep("Record and verify workload control runtime", "node_cache_workload");
+      const result = runWorkflowCommand("bash", ["-c", record.run ?? ""], {
+        env: { ...process.env, NODE_CACHE_HARNESS: root, NODE_CACHE_PREPARATION: prep },
+      });
+      expect(result.status).toBe(1);
+      const actual = JSON.parse(readFileSync(join(prep, "runtime.json"), "utf8"));
+      expect(actual).toMatchObject({
+        node: expect.stringMatching(/^v\d+/u),
+        v8: expect.any(String),
+        platform: expect.any(String),
+        architecture: expect.any(String),
+        executableSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      });
+      const log = readFileSync(join(prep, "runtime.log"), "utf8");
+      expect(log).toContain(JSON.stringify(actual));
+      expect(log).toContain("Hosted Node runtime differs from the fixed workload definition");
+    },
+  );
+
+  posixIt.each([true, false])("preserves workload terminal evidence when present=%s", (present) => {
+    const root = tempDirs.make("node-cache-workflow-finalize-");
+    const output = join(root, "results");
+    const prep = join(root, "preparation");
+    mkdirSync(output);
+    mkdirSync(prep);
+    const terminal = '{"status":"failure","error":"original control failure"}\n';
+    if (present) {
+      writeFileSync(join(output, "terminal-manifest.json"), terminal);
+    }
+    writeFileSync(join(prep, "install.log"), "preparation evidence\n");
+    writeFileSync(join(prep, "runtime.json"), '{"node":"observed-runtime"}\n');
+    const finalize = findStep("Finalize workload control artifact", "node_cache_workload");
+    expect(finalize.if).toBe("${{ always() }}");
+    expect(finalize.env).toMatchObject({
+      NODE_CACHE_PREPARATION: "${{ runner.temp }}/node-cache-preparation",
+      NODE_CACHE_OUTPUT: "${{ runner.temp }}/node-cache-workload-results",
+    });
+    const result = runWorkflowCommand("bash", ["-c", finalize.run ?? ""], {
+      env: {
+        ...process.env,
+        NODE_CACHE_OUTPUT: output,
+        NODE_CACHE_PREPARATION: prep,
+        JOB_STATUS: "failure",
+      },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const retained = readFileSync(join(output, "terminal-manifest.json"), "utf8");
+    if (present) {
+      expect(retained).toBe(terminal);
+    } else {
+      expect(JSON.parse(retained)).toMatchObject({
+        status: "failure",
+        phase: "workflow",
+        jobStatus: "failure",
+      });
+    }
+    expect(readFileSync(join(output, "preparation.log"), "utf8")).toBe("preparation evidence\n");
+    expect(readFileSync(join(output, "runtime.json"), "utf8")).toBe(
+      '{"node":"observed-runtime"}\n',
+    );
+  });
+
   posixIt("refuses a mismatched diagnostic target before running Node", () => {
     const root = tempDirs.make("node-cache-diagnostic-target-");
     const marker = join(root, "node-ran");
@@ -478,9 +634,9 @@ describe("OpenClaw performance workflow", () => {
 
   it("pins the Kova evaluator with release validation contracts", () => {
     const workflow = readFileSync(WORKFLOW, "utf8");
-    const canonicalKovaRef = "80d9aa6268515730f9880ea97add2a0d73f6fc7a";
+    const canonicalKovaRef = "5f1ac692af2058217c793aa06af9e28dbf46c1bd";
     const legacyKovaRef = "d69b2209905195bea06980721a92ad8b70808c5d";
-    const trustedLiveKovaRef = "80d9aa6268515730f9880ea97add2a0d73f6fc7a";
+    const trustedLiveKovaRef = "5f1ac692af2058217c793aa06af9e28dbf46c1bd";
     const install = findStep("Install OCM and Kova");
     const installRun = install.run ?? "";
     const targetCheckout = findStep("Checkout target metadata", "resolve_target");
@@ -648,7 +804,7 @@ describe("OpenClaw performance workflow", () => {
       expect(outputs).toMatchObject({
         checkout_ref: sha,
         tested_sha: sha,
-        kova_ref: "80d9aa6268515730f9880ea97add2a0d73f6fc7a",
+        kova_ref: "5f1ac692af2058217c793aa06af9e28dbf46c1bd",
         kova_config_contract: "canonical",
       });
     });
@@ -865,9 +1021,9 @@ describe("OpenClaw performance workflow", () => {
     const workflow = readFileSync(WORKFLOW, "utf8");
     const installRun = findStep("Install OCM and Kova").run ?? "";
 
-    expect(workflow).toContain("OCM_VERSION: v0.2.48");
+    expect(workflow).toContain("OCM_VERSION: v0.3.10");
     expect(workflow).toContain(
-      "OCM_LINUX_X64_SHA256: d0bdb49d69fa8bf3c3487ff04f4be82126828876f81690afdc002c427e22c1ac",
+      "OCM_LINUX_X64_SHA256: 78700755a592aeaf74915ad31addff60fd4a606d767d38b7ddc90411444c3479",
     );
     expect(installRun).toContain(
       '"https://github.com/openclaw/ocm/releases/download/${OCM_VERSION}/ocm-x86_64-unknown-linux-gnu.tar.gz"',
